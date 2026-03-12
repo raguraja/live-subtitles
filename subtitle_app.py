@@ -201,6 +201,45 @@ class VADChunker(threading.Thread):
         self._stop.set()
 
 
+# ── Hallucination filter ──────────────────────────────────────────────────────
+
+_HALLUCINATIONS = {
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for watching!",
+    "thank you for watching!",
+    "please subscribe",
+    "don't forget to subscribe",
+    "like and subscribe",
+    "subscribe to my channel",
+    "see you next time",
+    "see you in the next video",
+    "bye",
+    "bye bye",
+    "goodbye",
+    "subtitles by",
+    "transcribed by",
+    "www.",
+    ".com",
+    "[music]",
+    "[applause]",
+    "[ music ]",
+    "♪",
+}
+
+def _is_hallucination(text: str) -> bool:
+    t = text.strip().lower().rstrip(".!?,")
+    if t in _HALLUCINATIONS:
+        return True
+    if any(h in t for h in _HALLUCINATIONS if len(h) > 6):
+        return True
+    # Repetition: if >60% of words are the same word it's a loop hallucination
+    words = t.split()
+    if len(words) >= 4 and len(set(words)) / len(words) < 0.4:
+        return True
+    return False
+
+
 # ── Transcription ─────────────────────────────────────────────────────────────
 
 class Transcriber(threading.Thread):
@@ -238,7 +277,7 @@ class Transcriber(threading.Thread):
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
                 log.info(f"Transcribed [{info.language}]: {text[:80]}")
-                if text:
+                if text and not _is_hallucination(text):
                     lang = info.language if info.language != "en" else None
                     result_queue.put(("text", text, lang))
             except Exception as e:
