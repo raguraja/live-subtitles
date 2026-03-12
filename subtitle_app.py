@@ -40,11 +40,16 @@ SILENCE_MS        = 900       # ms of silence to end a segment
 MAX_SEGMENT_SEC   = 12
 MIN_SEGMENT_SEC   = 0.6
 ENERGY_THRESHOLD  = 0.003     # RMS threshold to consider as speech
-FONT_SIZE         = 22
+FONT_SIZE         = 11        # pt — fits 4 lines in 5cm height
 BG_COLOR          = "#111111"
 FG_COLOR          = "#ffffff"
 OVERLAY_ALPHA     = 0.85
-OVERLAY_WIDTH_PCT = 0.72
+MAX_LINES         = 4         # keep last N subtitles visible
+# Box size in cm → pixels at 96 DPI (1cm = 37.8px)
+BOX_W_CM          = 10        # 10cm ≈ 378px
+BOX_H_CM          = 5         # 5cm  ≈ 189px
+# Colours per subtitle line, oldest→newest
+LINE_COLORS       = ["#444444", "#777777", "#aaaaaa", "#ffffff"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 segment_queue: queue.Queue = queue.Queue(maxsize=8)
@@ -250,75 +255,141 @@ class SubtitleOverlay:
         self.root = tk.Tk()
         self.root.withdraw()
 
+        # Convert cm → pixels using screen DPI
+        dpi  = self.root.winfo_fpixels("1i")          # pixels per inch
+        ppcm = dpi / 2.54                              # pixels per cm
+        ow   = int(BOX_W_CM * ppcm)                   # box width  in px
+        oh   = int(BOX_H_CM * ppcm)                   # box height in px
+
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        ow = int(sw * OVERLAY_WIDTH_PCT)
+        ox = (sw - ow) // 2                            # centered horizontally
+        oy = sh - oh - 50                              # near bottom
 
-        ox = (sw - ow) // 2
-        oy = sh - 130
-
-        self.root.geometry(f"{ow}x110+{ox}+{oy}")
+        self.root.geometry(f"{ow}x{oh}+{ox}+{oy}")
         self.root.overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
         self.root.wm_attributes("-alpha", alpha)
         self.root.configure(bg=BG_COLOR)
 
+        # Rounded-border canvas frame
+        self._canvas = tk.Canvas(
+            self.root, bg=BG_COLOR, highlightthickness=1,
+            highlightbackground="#333333", bd=0,
+        )
+        self._canvas.pack(fill="both", expand=True)
+
         # Click-through
         try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            GWL_EXSTYLE = -20
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                                style | 0x80000 | 0x20)
+            hwnd  = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
         except Exception:
             pass
 
-        f = tkfont.Font(family="Segoe UI", size=FONT_SIZE, weight="bold")
-        self.label = tk.Label(
-            self.root, text="LiveSubtitles starting...",
-            font=f, fg=FG_COLOR, bg=BG_COLOR,
-            wraplength=ow - 40, justify="center",
-            padx=20, pady=12,
-        )
-        self.label.pack(fill="both", expand=True)
+        # Font
+        self._font     = tkfont.Font(family="Segoe UI", size=FONT_SIZE)
+        self._font_sm  = tkfont.Font(family="Segoe UI", size=8)
 
-        self.lang_label = tk.Label(
-            self.root, text="", fg="#999999", bg=BG_COLOR,
-            font=tkfont.Font(family="Segoe UI", size=10),
-        )
-        self.lang_label.place(relx=1.0, rely=0.0, anchor="ne", x=-6, y=4)
+        # Rolling subtitle history  (deque of strings)
+        self._history  = []          # list of str, max MAX_LINES items
+        self._status   = "Starting..."
 
-        # Drag
+        # Build MAX_LINES label rows inside the canvas frame
+        self._frame = tk.Frame(self._canvas, bg=BG_COLOR)
+        self._canvas.create_window(ow//2, oh//2, window=self._frame, anchor="center")
+
+        self._rows = []
+        for i in range(MAX_LINES):
+            lbl = tk.Label(
+                self._frame,
+                text="", font=self._font,
+                fg=LINE_COLORS[i], bg=BG_COLOR,
+                wraplength=ow - 16,
+                justify="left",
+                anchor="w",
+                padx=8, pady=1,
+            )
+            lbl.pack(fill="x", expand=False)
+            self._rows.append(lbl)
+
+        # Language tag (top-right corner)
+        self._lang_lbl = tk.Label(
+            self._canvas, text="", fg="#555555", bg=BG_COLOR,
+            font=self._font_sm,
+        )
+        self._lang_lbl.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=2)
+
+        # Drag support
         self._dx = self._dy = 0
-        self.label.bind("<ButtonPress-1>", lambda e: setattr(self, '_dx', e.x_root - self.root.winfo_x()) or setattr(self, '_dy', e.y_root - self.root.winfo_y()))
-        self.label.bind("<B1-Motion>",     lambda e: self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}"))
+        for widget in [self._canvas, self._frame] + self._rows:
+            widget.bind("<ButtonPress-1>", self._drag_start)
+            widget.bind("<B1-Motion>",     self._drag_move)
+            widget.bind("<Button-3>",      self._show_menu)
 
-        # Right-click quit
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Quit", command=self.root.destroy)
-        self.label.bind("<Button-3>", lambda e: menu.post(e.x_root, e.y_root))
+        # Right-click menu
+        self._menu = tk.Menu(self.root, tearoff=0)
+        self._menu.add_command(label="Quit", command=self.root.destroy)
 
         self._clear_job = None
+        self._render_status("Starting...")
         self.root.after(100, self._poll)
         self.root.deiconify()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _drag_start(self, e):
+        self._dx = e.x_root - self.root.winfo_x()
+        self._dy = e.y_root - self.root.winfo_y()
+
+    def _drag_move(self, e):
+        self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def _show_menu(self, e):
+        self._menu.post(e.x_root, e.y_root)
+
+    def _render_status(self, msg: str):
+        """Show a single status message across all rows."""
+        for i, lbl in enumerate(self._rows):
+            lbl.config(text=msg if i == MAX_LINES - 1 else "", fg="#555555")
+        self._lang_lbl.config(text="")
+
+    def _render_history(self):
+        """Render up to MAX_LINES subtitles, oldest dim → newest bright."""
+        # Pad with empty strings so we always fill MAX_LINES rows
+        padded = [""] * (MAX_LINES - len(self._history)) + list(self._history)
+        for i, (lbl, text) in enumerate(zip(self._rows, padded)):
+            lbl.config(text=text, fg=LINE_COLORS[i])
+
+    def _add_subtitle(self, text: str, lang: str | None):
+        self._history.append(text)
+        if len(self._history) > MAX_LINES:
+            self._history.pop(0)
+        self._render_history()
+        self._lang_lbl.config(text=f"[{lang}→en]" if lang else "")
+
+        # Cancel previous clear timer and set a new one
+        if self._clear_job:
+            self.root.after_cancel(self._clear_job)
+        self._clear_job = self.root.after(10000, self._fade_all)
+
+    def _fade_all(self):
+        """After silence, dim all rows to show we're waiting."""
+        for lbl in self._rows:
+            lbl.config(fg="#333333")
+        self._lang_lbl.config(text="")
+
+    # ── poll result queue ─────────────────────────────────────────────────────
 
     def _poll(self):
         try:
             while True:
                 item = result_queue.get_nowait()
                 if item[0] == "status":
-                    self.label.config(text=item[1], fg="#aaaaaa")
-                    self.lang_label.config(text="")
+                    self._render_status(item[1])
                 elif item[0] == "text":
-                    self.label.config(text=item[1], fg=FG_COLOR)
                     lang = item[2] if len(item) > 2 else None
-                    self.lang_label.config(text=f"[{lang}→en]" if lang else "")
-                    if self._clear_job:
-                        self.root.after_cancel(self._clear_job)
-                    self._clear_job = self.root.after(6000, lambda: (
-                        self.label.config(text=""),
-                        self.lang_label.config(text="")
-                    ))
+                    self._add_subtitle(item[1], lang)
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
